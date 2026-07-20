@@ -1,0 +1,6 @@
+mido>=1.3.2
+python-rtmidi>=1.5.8
+pygame>=2.5.0
+pydualsense>=0.7.5
+hidapi>=0.14.0
+PyQt6>=6.6.0

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kolbe"
+version = "1.0.2"
+description = "Convert gamepad/controller inputs into customizable MIDI signals"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "mido>=1.3.2",
+    "python-rtmidi>=1.5.8",
+    "pygame>=2.5.0",
+    "pydualsense>=0.7.5",
+    "hidapi>=0.14.0",
+    "PyQt6>=6.6.0",
+]
+
+[project.scripts]
+kolbe = "kolbe.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
