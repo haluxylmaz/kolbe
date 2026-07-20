@@ -2,7 +2,17 @@
 
 A desktop application that converts gamepad/controller inputs into highly customizable MIDI signals. Kolbe creates a virtual MIDI output port on your system so it can be used as a MIDI input device in DAWs, VJ software, and lighting consoles.
 
-## Requirements
+## 🚀 Download / Installation (For VJs & Lighting Operators)
+
+If you just want to use the application without installing Python or dealing with code, you can download the ready-to-use package:
+
+1. Go to the **[Releases](../../releases)** page on the right side of this repository.
+2. Download the latest `.zip` file for your operating system (e.g., `Kolbe_Windows.zip`).
+3. Extract the folder and simply run the `Kolbe.exe` executable inside. No installation required!
+
+---
+
+## Requirements (For Developers)
 
 * **Python 3.12** (Highly Recommended / Tested Version)
 * macOS, Windows, or Linux
