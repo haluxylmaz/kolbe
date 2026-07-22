@@ -28,6 +28,8 @@ class DualSenseController:
         self._ds: Optional[object] = None
         self._running = False
         self._touchpad_smoother = TouchpadSmoother()
+        self._last_led: Optional[tuple[int, int, int]] = None
+        self._lifecycle_closer = None
 
     def open(self) -> None:
         try:
@@ -44,10 +46,44 @@ class DualSenseController:
         self._ds = pydualsense()
         self._ds.init()
         self._running = True
+        from kolbe.controller.hid_lifecycle import register_hid_closer
+
+        self._lifecycle_closer = self.close
+        register_hid_closer(self._lifecycle_closer)
+        self._last_led = None
         logger.info("Opened DualSense HID backend: %s", self.device.name)
 
+    def set_led(self, r: int, g: int, b: int) -> bool:
+        if not self._running or self._ds is None:
+            return False
+        color = (max(0, min(255, int(r))), max(0, min(255, int(g))), max(0, min(255, int(b))))
+        if self._last_led == color:
+            return True
+        try:
+            light = getattr(self._ds, "light", None)
+            if light is not None and hasattr(light, "setColorI"):
+                light.setColorI(color[0], color[1], color[2])
+                self._last_led = color
+                return True
+        except Exception:
+            logger.debug("DualSense set_led failed", exc_info=True)
+        return False
+
     def close(self) -> None:
+        try:
+            self.set_led(0, 0, 0)
+        except Exception:
+            pass
         self._running = False
+        closer = getattr(self, "_lifecycle_closer", None)
+        self._lifecycle_closer = None
+        if closer is not None:
+            try:
+                from kolbe.controller.hid_lifecycle import unregister_hid_closer
+
+                unregister_hid_closer(closer)
+            except Exception:
+                pass
         ds = self._ds
         self._ds = None
         if ds is not None:
@@ -125,12 +161,21 @@ class DualSenseController:
 
         battery = None
         battery_label = None
-        if hasattr(self._ds, "battery") and hasattr(self._ds.battery, "Level"):
-            raw = int(self._ds.battery.Level)
-            # pydualsense reports 0–10 steps; normalize to percent when needed.
-            battery = raw * 10 if raw <= 10 else min(raw, 100)
-            battery_label = f"{battery}%"
-        else:
+        # Prefer cable/charging state from pydualsense when available.
+        state_name = ""
+        if hasattr(self._ds, "battery"):
+            batt = self._ds.battery
+            if hasattr(batt, "State"):
+                state_name = str(getattr(batt, "State", "") or "").lower()
+            if hasattr(batt, "Level"):
+                raw = int(batt.Level)
+                # pydualsense reports 0–10 steps; normalize to percent when needed.
+                battery = raw * 10 if raw <= 10 else min(raw, 100)
+                battery_label = f"{battery}%"
+        if any(token in state_name for token in ("charging", "full", "wired", "cable")):
+            battery = None
+            battery_label = "Wired"
+        elif battery is None:
             battery_label = "Wired"
 
         return ControllerState(

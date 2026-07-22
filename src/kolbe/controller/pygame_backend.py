@@ -252,34 +252,58 @@ class PygameController:
             and self._joystick is not None
             and self._identity_matches(self._joystick)
         ):
-            return
-
-        if self._joystick is not None:
             try:
-                self._joystick.quit()
+                if self._joystick.get_init():
+                    return
             except Exception:
                 pass
-            self._joystick = None
 
+        # Do NOT joy.quit() the previous handle before we have a replacement —
+        # quitting while a sensor companion shares the HID path causes Windows
+        # to emit phantom JOYDEVICEREMOVED and tears down sibling pads.
+        previous = self._joystick
         index = find_joystick_index_for_device(self.device)
         if index is None:
             self._bound_index = None
+            # Keep previous handle if it still answers — transient scan glitch.
+            if previous is not None:
+                try:
+                    if previous.get_init() and self._identity_matches(previous):
+                        self._joystick = previous
+                        return
+                except Exception:
+                    pass
+            self._joystick = None
             return
 
-        joy = pygame.joystick.Joystick(index)
-        joy.init()
+        try:
+            joy = pygame.joystick.Joystick(index)
+            if not joy.get_init():
+                joy.init()
+        except Exception:
+            logger.debug("pygame Joystick init failed at index %s", index, exc_info=True)
+            self._bound_index = None
+            if previous is not None:
+                try:
+                    if previous.get_init():
+                        self._joystick = previous
+                        return
+                except Exception:
+                    pass
+            self._joystick = None
+            return
+
         if not self._identity_matches(joy):
-            # Defensive: never attach the wrong physical pad.
             logger.warning(
                 "Refusing pygame bind for %s — identity mismatch at index %s",
                 self.device.name,
                 index,
             )
-            try:
-                joy.quit()
-            except Exception:
-                pass
             self._bound_index = None
+            if previous is not None:
+                self._joystick = previous
+            else:
+                self._joystick = None
             return
 
         self._joystick = joy
@@ -292,6 +316,16 @@ class PygameController:
         if guid:
             self.device.guid = guid
         self._select_button_map(joy.get_numbuttons())
+
+    def is_alive(self) -> bool:
+        """True if the SDL joystick handle still looks usable."""
+        joy = self._joystick
+        if joy is None:
+            return False
+        try:
+            return bool(joy.get_init()) and self._identity_matches(joy)
+        except Exception:
+            return False
 
     def _select_button_map(self, num_buttons: int) -> None:
         """Pick SDL2 vs legacy PS map from the live button count."""
@@ -313,13 +347,30 @@ class PygameController:
             pygame.event.pump()
 
         # Re-resolve if SDL reshuffled indices or our handle went stale.
-        self._bind_joystick(force=False)
-        if self._joystick is None or not self._identity_matches(self._joystick):
-            self._bind_joystick(force=True)
-        if self._joystick is None:
-            raise RuntimeError(f"Lost pygame binding for {self.device.id}")
+        try:
+            self._bind_joystick(force=False)
+            if self._joystick is None or not self._identity_matches(self._joystick):
+                self._bind_joystick(force=True)
+        except Exception:
+            logger.debug("pygame bind during poll failed", exc_info=True)
 
-        joy = self._joystick
+        if self._joystick is None:
+            # Transient loss (phantom JOYDEVICEREMOVED / shared HID) — keep alive.
+            if self._cached_state is not None:
+                return self._cached_state
+            return ControllerState(device=self.device)
+
+        try:
+            return self._read_state_from_joystick(self._joystick)
+        except Exception:
+            logger.debug("pygame state read failed — returning cache", exc_info=True)
+            if self._cached_state is not None:
+                return self._cached_state
+            return ControllerState(device=self.device)
+
+    def _read_state_from_joystick(
+        self, joy: pygame.joystick.JoystickType
+    ) -> ControllerState:
         num_buttons = joy.get_numbuttons()
         num_axes = joy.get_numaxes()
         if self._is_playstation:
@@ -380,6 +431,15 @@ class PygameController:
             if source in _DPAD_SOURCES:
                 continue
             buttons[source.value] = pressed
+
+        # DualSense/DS4: SDL maps touchpad click at 16 (modern) or 15 (legacy).
+        # OR both indices so a firmware/SDL mismatch never drops the click.
+        if self._is_playstation:
+            click = bool(buttons.get(InputSource.TOUCHPAD_CLICK.value, False))
+            for idx in (15, 16):
+                if idx < len(button_vals):
+                    click = click or bool(button_vals[idx])
+            buttons[InputSource.TOUCHPAD_CLICK.value] = click
 
         for axis_id, value in enumerate(axis_vals):
             source = self._axis_map.get(axis_id)

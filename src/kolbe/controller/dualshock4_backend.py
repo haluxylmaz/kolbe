@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Optional
 
-from kolbe.controller.touchpad_smoother import TouchpadSmoother
 from kolbe.controller.ds4_hid import (
     DS4ConnectionType,
     DS4HidDeviceInfo,
-    build_bt_enable_report,
+    enable_ds4_input_streaming,
     find_ds4_hid_device,
     has_hidapi,
     parse_ds4_input_report,
+    read_ds4_hid_report,
+    sony_product_id_from_guid,
 )
+from kolbe.controller.touchpad_smoother import TouchpadSmoother
 from kolbe.controller.types import (
     ControllerDevice,
     ControllerState,
@@ -34,6 +35,10 @@ class DualShock4Controller:
         self._last_report: Optional[bytes] = None
         self._touchpad_smoother = TouchpadSmoother()
         self._closed = False
+        self._reenable_attempted = False
+        self._empty_polls = 0
+        self._lifecycle_closer: Optional[object] = None
+        self._last_led: Optional[tuple[int, int, int]] = None
 
     def open(self) -> None:
         if not has_hidapi():
@@ -41,20 +46,20 @@ class DualShock4Controller:
 
         import hid
 
-        self._hid_info = find_ds4_hid_device()
+        preferred = sony_product_id_from_guid(self.device.guid)
+        self._hid_info = find_ds4_hid_device(preferred_product_id=preferred)
         if self._hid_info is None:
             raise RuntimeError("DualShock 4 HID device not found. Unplug other Sony tools and retry.")
 
         self._hid = hid.device()
         self._hid.open_path(self._hid_info.path)
         self._hid.set_nonblocking(True)
+        enable_ds4_input_streaming(self._hid, self._hid_info.connection_type)
 
-        if self._hid_info.connection_type == DS4ConnectionType.BLUETOOTH:
-            try:
-                self._hid.write(build_bt_enable_report())
-                time.sleep(0.05)
-            except OSError:
-                logger.warning("Failed to send DS4 BT enable report", exc_info=True)
+        from kolbe.controller.hid_lifecycle import register_hid_closer
+
+        self._lifecycle_closer = self.close
+        register_hid_closer(self._lifecycle_closer)  # type: ignore[arg-type]
 
         self.device.backend = "dualshock4"
         logger.info(
@@ -64,32 +69,77 @@ class DualShock4Controller:
         )
 
     def close(self) -> None:
-        if self._closed:
+        if self._closed and self._hid is None:
             return
         self._closed = True
-        logger.info("Closing DualShock 4 backend")
-        hid = self._hid
-        self._hid = None
-        if hid is not None:
+        closer = self._lifecycle_closer
+        self._lifecycle_closer = None
+        if closer is not None:
             try:
-                hid.close()
-            except OSError:
+                from kolbe.controller.hid_lifecycle import unregister_hid_closer
+
+                unregister_hid_closer(closer)  # type: ignore[arg-type]
+            except Exception:
+                pass
+        logger.info("Closing DualShock 4 backend")
+        hid_dev = self._hid
+        self._hid = None
+        if hid_dev is not None:
+            try:
+                hid_dev.close()
+            except Exception:
                 logger.exception("Error closing DS4 HID device")
         self._hid_info = None
         self._last_report = None
 
+    def set_led(self, r: int, g: int, b: int) -> bool:
+        if self._closed or self._hid is None or self._hid_info is None:
+            return False
+        color = (max(0, min(255, int(r))), max(0, min(255, int(g))), max(0, min(255, int(b))))
+        if self._last_led == color:
+            return True
+        from kolbe.controller.ps_led import set_led_on_device
+
+        ok = set_led_on_device(
+            self._hid,
+            kind="ds4",
+            connection_type=self._hid_info.connection_type,
+            r=color[0],
+            g=color[1],
+            b=color[2],
+        )
+        if ok:
+            self._last_led = color
+        return ok
+
     def shutdown(self) -> None:
+        try:
+            self.set_led(0, 0, 0)
+        except Exception:
+            pass
         self.close()
 
     def poll(self) -> ControllerState:
         if self._closed or self._hid is None:
             return ControllerState(device=self.device)
 
-        report = self._read_latest_report()
-        if report is None and self._last_report is None:
-            return ControllerState(device=self.device)
-
-        if report is not None:
+        report = read_ds4_hid_report(self._hid)
+        if report is None:
+            self._empty_polls += 1
+            if (
+                not self._reenable_attempted
+                and self._empty_polls >= 10
+                and self._hid_info is not None
+            ):
+                self._reenable_attempted = True
+                try:
+                    enable_ds4_input_streaming(self._hid, self._hid_info.connection_type)
+                except Exception:
+                    logger.debug("DS4 backend deferred re-enable failed", exc_info=True)
+            if self._last_report is None:
+                return ControllerState(device=self.device)
+        else:
+            self._empty_polls = 0
             self._last_report = report
 
         parsed = parse_ds4_input_report(self._last_report or b"")
@@ -107,6 +157,20 @@ class DualShock4Controller:
             axes[InputSource.TOUCHPAD_1_X.value] = touchpad[1].x
             axes[InputSource.TOUCHPAD_1_Y.value] = touchpad[1].y
 
+        usb = (
+            self._hid_info is not None
+            and self._hid_info.connection_type == DS4ConnectionType.USB
+        )
+        if usb:
+            batt_percent = None
+            batt_label = "Wired"
+        elif parsed.battery_percent is not None:
+            batt_percent = parsed.battery_percent
+            batt_label = f"{parsed.battery_percent}%"
+        else:
+            batt_percent = None
+            batt_label = "Wired"
+
         return ControllerState(
             device=self.device,
             buttons=dict(parsed.buttons),
@@ -114,24 +178,6 @@ class DualShock4Controller:
             touchpad=touchpad,
             gyro=dict(parsed.gyro),
             accelerometer=dict(parsed.accelerometer),
-            battery_percent=parsed.battery_percent,
-            battery_label=(
-                f"{parsed.battery_percent}%"
-                if parsed.battery_percent is not None
-                else "Wired"
-            ),
+            battery_percent=batt_percent,
+            battery_label=batt_label,
         )
-
-    def _read_latest_report(self) -> Optional[bytes]:
-        if self._hid is None:
-            return None
-        latest: Optional[bytes] = None
-        try:
-            while True:
-                chunk = self._hid.read(128)
-                if not chunk:
-                    break
-                latest = bytes(chunk)
-        except OSError:
-            logger.debug("DS4 HID read error", exc_info=True)
-        return latest

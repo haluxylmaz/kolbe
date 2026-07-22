@@ -53,6 +53,16 @@ def run_app() -> int:
         window.setWindowIcon(QIcon(str(icon_path)))
     window.show()
 
+    def _on_about_to_quit() -> None:
+        try:
+            from kolbe.controller.hid_lifecycle import force_close_all_hid_handles
+
+            force_close_all_hid_handles()
+        except Exception:
+            logger.debug("aboutToQuit HID force-close failed", exc_info=True)
+
+    app.aboutToQuit.connect(_on_about_to_quit)
+
     return app.exec()
 
 

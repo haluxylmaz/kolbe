@@ -66,7 +66,8 @@ class ControllerSlotsPanel(QFrame):
         root.addLayout(header)
 
         hint = QLabel(
-            "Assign each physical gamepad to a fixed slot (1–4). "
+            "Assign any gamepad to any slot (1–4). "
+            "Moving onto an occupied slot swaps the two pads. "
             "Mappings follow the slot — not plug-in order."
         )
         hint.setWordWrap(True)

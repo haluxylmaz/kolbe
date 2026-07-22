@@ -25,6 +25,9 @@ class PygameEventPump(QObject):
         super().__init__(parent)
 
     def start(self) -> None:
+        from kolbe.sdl_bootstrap import apply_joystick_hints
+
+        apply_joystick_hints(force=True)
         import pygame
 
         if not pygame.get_init():
@@ -76,7 +79,22 @@ class ControllerWorker(QObject):
         finally:
             self._lock.unlock()
 
+    def apply_slot_leds(
+        self, colors_by_hardware_id: dict[str, Optional[tuple[int, int, int]]]
+    ) -> None:
+        """Queue slot lightbar colors; applied on the next poll tick."""
+        self._lock.lock()
+        try:
+            manager = self._manager
+        finally:
+            self._lock.unlock()
+        if manager is not None:
+            manager.apply_slot_leds(colors_by_hardware_id)
+
     def start_polling(self) -> None:
+        from kolbe.sdl_bootstrap import apply_joystick_hints
+
+        apply_joystick_hints(force=True)
         import pygame
 
         self._running = True
@@ -149,7 +167,17 @@ class ControllerWorker(QObject):
             if not pygame.get_init():
                 return
             pygame.event.pump()
-            pygame.event.clear()
+            # Drain the queue but do NOT let device-removed events sit around.
+            # We intentionally ignore JOYDEVICEREMOVED here — shared HID opens
+            # (sensor companion) cause phantom removals on Windows. Live pads
+            # are tracked by MultiControllerManager health checks instead.
+            for event in pygame.event.get():
+                etype = getattr(event, "type", None)
+                if etype in (
+                    getattr(pygame, "JOYDEVICEADDED", None),
+                    getattr(pygame, "JOYDEVICEREMOVED", None),
+                ):
+                    logger.debug("Ignoring SDL hotplug event: %s", event)
         except Exception:
             logger.debug("pygame event flush failed", exc_info=True)
 
@@ -157,8 +185,16 @@ class ControllerWorker(QObject):
         self._last_emitted.clear()
         if self._manager is not None:
             logger.info("Controller worker shutting down hardware")
-            self._manager.shutdown()
-            self._manager = None
+            try:
+                self._manager.shutdown()
+            finally:
+                self._manager = None
+        try:
+            from kolbe.controller.hid_lifecycle import force_close_all_hid_handles
+
+            force_close_all_hid_handles()
+        except Exception:
+            logger.debug("HID force-close during worker cleanup failed", exc_info=True)
 
 
 class ControllerThread(QThread):
@@ -176,6 +212,12 @@ class ControllerThread(QThread):
         if self._worker is not None:
             self._worker.request_refresh()
 
+    def apply_slot_leds(
+        self, colors_by_hardware_id: dict[str, Optional[tuple[int, int, int]]]
+    ) -> None:
+        if self._worker is not None:
+            self._worker.apply_slot_leds(colors_by_hardware_id)
+
     def run(self) -> None:
         self._worker = ControllerWorker()
         self._worker.state_updated.connect(self.state_updated.emit)
@@ -188,7 +230,30 @@ class ControllerThread(QThread):
         if self._worker is not None:
             self._worker.stop_polling()
         self.quit()
-        if not self.wait(8000):
-            logger.warning("Controller thread did not finish within 8s")
+        finished = self.wait(5000)
+        if not finished:
+            logger.warning(
+                "Controller thread did not finish within 5s — "
+                "force-closing HID handles and terminating worker"
+            )
+            try:
+                from kolbe.controller.hid_lifecycle import force_close_all_hid_handles
+
+                force_close_all_hid_handles()
+            except Exception:
+                logger.debug("force_close_all_hid_handles failed", exc_info=True)
+            try:
+                self.terminate()
+                self.wait(2000)
+            except Exception:
+                logger.debug("ControllerThread.terminate failed", exc_info=True)
         else:
             logger.info("Controller thread stopped")
+        # Belt-and-suspenders: always release HID even on clean stop.
+        try:
+            from kolbe.controller.hid_lifecycle import force_close_all_hid_handles
+
+            force_close_all_hid_handles()
+        except Exception:
+            pass
+        self._worker = None

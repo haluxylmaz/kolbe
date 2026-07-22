@@ -21,6 +21,7 @@ from kolbe import APP_NAME
 from kolbe.controller.slots import (
     SLOT_NUMBERS,
     accent_for_slot,
+    led_color_for_slot,
     slot_id,
     slot_label,
 )
@@ -269,9 +270,20 @@ class MainWindow(QMainWindow):
     def _on_slot_assignment_changed(self, slot: int, _hardware_id: object) -> None:
         self._sync_topbar_slots()
         self._persist_slot_assignments()
+        self._sync_slot_leds()
         self._mapping_engine.log_system(f"{slot_label(slot)} assignment updated")
         if slot == self._selected_slot:
             self._on_slot_selected(slot)
+
+    def _sync_slot_leds(self) -> None:
+        """Push each connected pad's slot theme color to its lightbar."""
+        if self._controller_thread is None:
+            return
+        colors: dict[str, Optional[tuple[int, int, int]]] = {}
+        for slot in self.slots_panel.snapshot_slots():
+            if slot.connected and slot.hardware_id:
+                colors[slot.hardware_id] = led_color_for_slot(slot.number)
+        self._controller_thread.apply_slot_leds(colors)
 
     def _on_rescan_controllers(self) -> None:
         if self._controller_thread is not None:
@@ -323,20 +335,34 @@ class MainWindow(QMainWindow):
         self._preset_manager.save_startup_preset(preset)
 
     def _on_cleanup_project(self) -> None:
-        from kolbe.utils.project_cleanup import cleanup_project
+        """Global reset: empty show (no mappings) while keeping hardware slot assignments."""
+        reply = QMessageBox.question(
+            self,
+            "Clean Show",
+            "Clear all mappings and reset to an empty show?\n\n"
+            "Hardware slot assignments will be kept. Controllers stay connected.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
 
-        removed = cleanup_project()
-        if removed:
-            summary = "\n".join(str(p) for p in removed[:12])
-            extra = f"\n…and {len(removed) - 12} more" if len(removed) > 12 else ""
-            QMessageBox.information(
-                self,
-                "Project Cleanup",
-                f"Removed {len(removed)} junk path(s):\n{summary}{extra}",
-            )
-            self._mapping_engine.log_system(f"Project cleanup removed {len(removed)} junk path(s)")
-        else:
-            QMessageBox.information(self, "Project Cleanup", "No junk files found.")
+        slots = self.slots_panel.assignments()
+        midi_port = self._mapping_engine.preset.midi_output_port
+        empty = PresetData(
+            name="Untitled",
+            slot_assignments=dict(slots),
+            midi_output_port=midi_port,
+        )
+        self._apply_preset(empty)
+        self._preset_manager.mark_untitled()
+        try:
+            self._preset_manager.save_startup_preset(empty)
+        except OSError as exc:
+            logger.warning("Could not save cleaned show: %s", exc)
+        self._mapping_engine.log_system(
+            "Show cleaned — all mappings cleared; slot assignments preserved"
+        )
 
     def _on_template_selected(self, template_name: str) -> None:
         reply = QMessageBox.question(
@@ -394,6 +420,7 @@ class MainWindow(QMainWindow):
         # Keep persisted assignments when possible; auto-fill empties.
         self._persist_slot_assignments()
         self._sync_topbar_slots()
+        self._sync_slot_leds()
 
         connected = [s for s in self.slots_panel.snapshot_slots() if s.connected]
         if connected:
@@ -434,9 +461,14 @@ class MainWindow(QMainWindow):
         remapped = self._remap_state_to_slot(state)
         if remapped is None:
             return
-        label = state.battery_label or ("Wired" if state.battery_percent is None else None)
-        if label:
+        # Prefer HID companion / report label; Wired must win over a stale percent.
+        label = state.battery_label
+        if label == "Wired":
+            self.slots_panel.update_battery(state.device.id, None, "Wired")
+        elif label:
             self.slots_panel.update_battery(state.device.id, state.battery_percent, label)
+        elif state.battery_percent is None:
+            self.slots_panel.update_battery(state.device.id, None, "Wired")
         else:
             self.slots_panel.update_battery(state.device.id, state.battery_percent)
         # Latest-wins coalesce per slot so simultaneous pads never block each other.
@@ -482,6 +514,13 @@ class MainWindow(QMainWindow):
             self._controller_thread.stop()
             self._controller_thread = None
 
+        try:
+            from kolbe.controller.hid_lifecycle import force_close_all_hid_handles
+
+            force_close_all_hid_handles()
+        except Exception:
+            logger.debug("HID force-close on window close failed", exc_info=True)
+
         self._mapping_engine.shutdown()
 
         if self._midi_port is not None:
@@ -494,3 +533,8 @@ class MainWindow(QMainWindow):
         logger.info("Application shutdown complete")
         event.accept()
         super().closeEvent(event)
+        from PyQt6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()

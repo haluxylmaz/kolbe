@@ -4,10 +4,25 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import time
 from typing import Optional
+
+# SDL HIDAPI ON before any controller/pygame import (DirectInput scrambles PS maps).
+os.environ["SDL_JOYSTICK_HIDAPI"] = "1"
+os.environ["SDL_JOYSTICK_HIDAPI_PS4"] = "1"
+os.environ["SDL_JOYSTICK_HIDAPI_PS5"] = "1"
+os.environ["SDL_JOYSTICK_DIRECTINPUT"] = "0"
+os.environ["SDL_JOYSTICK_RAWINPUT"] = "0"
+
+try:
+    from kolbe.sdl_bootstrap import apply_joystick_hints
+
+    apply_joystick_hints(force=True)
+except Exception:
+    pass
 
 from kolbe.controller import ControllerManager, detect_controllers
 from kolbe.midi import VirtualMidiPort, list_midi_ports

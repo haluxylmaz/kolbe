@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import struct
+import time
 import zlib
 from dataclasses import dataclass
 from enum import Enum
@@ -51,12 +52,41 @@ class DS4HidDeviceInfo:
 
 
 def has_hidapi() -> bool:
+    """True when the ``hid`` module can load (DLL preloaded when possible)."""
     try:
+        from kolbe.hidapi_bootstrap import ensure_hidapi_loaded
+
+        ensure_hidapi_loaded()
         import hid  # noqa: F401
 
         return True
-    except ImportError:
+    except (ImportError, OSError):
         return False
+
+
+def sony_product_id_from_guid(guid: Optional[str]) -> Optional[int]:
+    """Extract USB product id from an SDL joystick GUID (LE bytes 8–9).
+
+    Example DualSense: ``0300....4c050000e60c0000...`` → ``0x0CE6``.
+    """
+    if not guid:
+        return None
+    hex_str = guid.strip().lower().replace("-", "")
+    if len(hex_str) < 20:
+        return None
+    try:
+        # GUID bytes 8–9 are product id little-endian (chars 16–19).
+        return int(hex_str[18:20] + hex_str[16:18], 16)
+    except ValueError:
+        return None
+
+
+def is_dualsense_product(product_id: int) -> bool:
+    return product_id in DUALSENSE_PRODUCT_IDS
+
+
+def is_ds4_product(product_id: int) -> bool:
+    return product_id in DS4_PRODUCT_IDS
 
 
 def _ps_crc32(seed: int, data: bytes) -> int:
@@ -226,8 +256,13 @@ def parse_ds4_input_report(report: bytes) -> Optional[ParsedDS4Report]:
     )
 
 
-def find_ds4_hid_device() -> Optional[DS4HidDeviceInfo]:
-    """Locate the first connected DualShock 4 via hidapi."""
+def find_ds4_hid_device(
+    *,
+    preferred_product_id: Optional[int] = None,
+) -> Optional[DS4HidDeviceInfo]:
+    """Locate a DualShock 4 HID interface, optionally matching a product id."""
+    if not has_hidapi():
+        return None
     import hid
 
     candidates: list[DS4HidDeviceInfo] = []
@@ -239,17 +274,22 @@ def find_ds4_hid_device() -> Optional[DS4HidDeviceInfo]:
         if not path:
             continue
         interface = info.get("interface_number", -1)
-        conn = DS4ConnectionType.USB
-        if interface == -1 or interface >= 0:
-            # macOS BT devices often have interface -1
-            product = info.get("product_string") or "DualShock 4"
-            if "wireless" in product.lower() or interface == -1:
-                conn = DS4ConnectionType.BLUETOOTH
+        # Prefer hidapi bus_type when present (1=USB, 2=Bluetooth).
+        bus = info.get("bus_type")
+        if bus == 2:
+            conn = DS4ConnectionType.BLUETOOTH
+        elif bus == 1:
+            conn = DS4ConnectionType.USB
+        elif isinstance(interface, int) and interface >= 0:
+            conn = DS4ConnectionType.USB
+        else:
+            conn = DS4ConnectionType.BLUETOOTH
+        product = info.get("product_string") or "DualShock 4"
         candidates.append(
             DS4HidDeviceInfo(
                 path=path,
                 product_id=pid,
-                product_string=info.get("product_string") or "DualShock 4",
+                product_string=product,
                 connection_type=conn,
             )
         )
@@ -257,8 +297,19 @@ def find_ds4_hid_device() -> Optional[DS4HidDeviceInfo]:
     if not candidates:
         return None
 
-    # Prefer Bluetooth interface on macOS (user's PS4 is likely BT)
-    candidates.sort(key=lambda c: (c.connection_type != DS4ConnectionType.BLUETOOTH, c.product_id))
+    if preferred_product_id is not None:
+        matched = [c for c in candidates if c.product_id == preferred_product_id]
+        if matched:
+            candidates = matched
+
+    # Prefer USB (stable motion reports) then product / path for determinism.
+    candidates.sort(
+        key=lambda c: (
+            c.connection_type != DS4ConnectionType.USB,
+            c.product_id,
+            c.path,
+        )
+    )
     return candidates[0]
 
 
@@ -276,3 +327,112 @@ def build_bt_enable_report() -> bytes:
     crc = _ps_crc32(PS_OUTPUT_CRC32_SEED, bytes(report[:-4]))
     struct.pack_into("<I", report, 74, crc)
     return bytes(report)
+
+
+def build_usb_kick_report() -> bytes:
+    """USB DS4 output report (LED/rumble init) — can wake input streaming on Windows."""
+    report = bytearray(32)
+    report[0] = 0x05
+    report[1] = 0xFF  # enable flags
+    return bytes(report)
+
+
+def coerce_ds4_input_report(data: bytes) -> Optional[bytes]:
+    """Normalize raw HID bytes into a parseable DS4 USB/BT input report."""
+    if not data:
+        return None
+    raw = bytes(data)
+    if raw[0] in (0x01, 0x11) and len(raw) >= 10:
+        return raw
+    # Windows HidD_GetInputReport sometimes prepends a 0x00 status byte.
+    if len(raw) >= 11 and raw[0] == 0x00 and raw[1] in (0x01, 0x11):
+        return raw[1:]
+    return None
+
+
+def _plausible_ds4_live_report(report: bytes) -> bool:
+    """Reject descriptor-like get_input_report payloads that aren't live pad state."""
+    if report[0] == 0x01 and len(report) >= 64:
+        off = 1
+    elif report[0] == 0x11 and len(report) >= 78:
+        off = 3
+    else:
+        return False
+    sticks = report[off : off + 4]
+    # Resting / near-rest sticks sit around 0x80. Descriptor junk is often 00/01/03/05.
+    near_center = sum(1 for value in sticks if 40 <= value <= 215) >= 3
+    return near_center
+
+
+def enable_ds4_input_streaming(hid_dev: object, connection_type: DS4ConnectionType) -> None:
+    """Best-effort USB kick + BT feature enable so motion reports start flowing."""
+    try:
+        written = hid_dev.write(build_usb_kick_report())  # type: ignore[attr-defined]
+        logger.debug("DS4 USB kick write returned %s", written)
+        time.sleep(0.03)
+    except OSError:
+        logger.debug("DS4 USB kick write failed", exc_info=True)
+
+    # Always attempt BT enable as well — some Windows stacks report USB bus_type
+    # for Bluetooth DS4s that still need the 0x11 feature report.
+    try:
+        written = hid_dev.write(build_bt_enable_report())  # type: ignore[attr-defined]
+        if written is not None and written < 0:
+            logger.debug(
+                "DS4 BT enable write returned %s (conn=%s)",
+                written,
+                connection_type.value,
+            )
+        time.sleep(0.05)
+    except OSError:
+        logger.debug("DS4 BT enable write failed", exc_info=True)
+
+
+def read_ds4_hid_report(
+    hid_dev: object,
+    *,
+    allow_get_input_report: bool = True,
+) -> Optional[bytes]:
+    """
+    Read the newest DS4 input report.
+
+    Prefer interrupt ``read()``. ``get_input_report`` is optional — the sensor
+    companion must leave it off (passive share with SDL HIDAPI). The exclusive
+    DualShock4Controller backend may enable it as a fallback.
+    """
+    latest: Optional[bytes] = None
+    try:
+        while True:
+            chunk = hid_dev.read(128)  # type: ignore[attr-defined]
+            if not chunk:
+                break
+            coerced = coerce_ds4_input_report(bytes(chunk))
+            if coerced is not None:
+                latest = coerced
+    except OSError:
+        logger.debug("DS4 HID interrupt read error", exc_info=True)
+
+    if latest is not None:
+        return latest
+
+    if not allow_get_input_report:
+        return None
+
+    getter = getattr(hid_dev, "get_input_report", None)
+    if not callable(getter):
+        return None
+
+    for report_id, size in ((0x01, 64), (0x01, 78), (0x11, 78), (0x11, 547)):
+        try:
+            raw = getter(report_id, size)
+        except Exception:
+            continue
+        if not raw:
+            continue
+        coerced = coerce_ds4_input_report(bytes(raw))
+        if coerced is None or not _plausible_ds4_live_report(coerced):
+            continue
+        if parse_ds4_input_report(coerced) is None:
+            continue
+        return coerced
+    return None

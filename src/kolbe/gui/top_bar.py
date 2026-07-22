@@ -113,7 +113,9 @@ class TopBar(QFrame):
         layout.addWidget(load_btn)
 
         cleanup_btn = QPushButton("Clean")
-        cleanup_btn.setToolTip("Remove __pycache__, .pyc files, and build artifacts")
+        cleanup_btn.setToolTip(
+            "Clear all mappings to an empty show. Hardware slot assignments are kept."
+        )
         cleanup_btn.clicked.connect(lambda: self._on_cleanup_project and self._on_cleanup_project())
         layout.addWidget(cleanup_btn)
 

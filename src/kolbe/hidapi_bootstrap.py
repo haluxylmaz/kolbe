@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 _DLL_NAMES = ("hidapi.dll", "libhidapi-0.dll")
 _MISSING_LOGGED = False
+_LOADED_PATH: Path | None = None
 
 
 def _exe_dir() -> Path:
@@ -31,6 +32,19 @@ def _bundle_dir() -> Path | None:
     if meipass:
         return Path(meipass).resolve()
     return None
+
+
+def _pydualsense_dir() -> Path | None:
+    """Locate the installed pydualsense package dir (ships hidapi.dll on Windows)."""
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("pydualsense")
+        if spec is None or not spec.origin:
+            return None
+        return Path(spec.origin).resolve().parent
+    except Exception:
+        return None
 
 
 def _candidate_files() -> list[Path]:
@@ -70,6 +84,9 @@ def _candidate_files() -> list[Path]:
                 sp,
             ]
         )
+        pds = _pydualsense_dir()
+        if pds is not None:
+            search_roots.append(pds)
 
     for root in search_roots:
         for name in _DLL_NAMES:
@@ -118,6 +135,10 @@ def ensure_hidapi_loaded() -> Path | None:
     Returns the resolved path on success, or None if unavailable.
     Never raises — missing DLL disables DualSense HID only.
     """
+    global _LOADED_PATH
+    if _LOADED_PATH is not None:
+        return _LOADED_PATH
+
     try:
         dll = find_hidapi_dll()
         if dll is None:
@@ -139,7 +160,8 @@ def ensure_hidapi_loaded() -> Path | None:
             os.environ["PATH"] = parent + os.pathsep + path_env
 
         ctypes.WinDLL(str(dll))
-        logger.debug("Preloaded hidapi DLL: %s", dll)
+        _LOADED_PATH = dll
+        logger.info("Preloaded hidapi DLL: %s", dll)
         return dll
     except Exception as exc:
         _log_missing(f"hidapi preload failed gracefully: {exc!r}")

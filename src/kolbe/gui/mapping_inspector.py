@@ -86,6 +86,19 @@ class MappingInspectorPanel(QWidget):
         )
         self.lock_btn.toggled.connect(self._on_lock_toggled)
         title_row.addWidget(self.lock_btn)
+
+        self.delete_btn = QPushButton("Delete Mapping")
+        self.delete_btn.setObjectName("dangerButton")
+        self.delete_btn.setToolTip("Remove this mapping from the selected control (unlock first if Locked).")
+        self.delete_btn.setStyleSheet(
+            "QPushButton { color: #121212; background: #FF6B6B; border: 1px solid #FF6B6B; "
+            "font-weight: 700; padding: 6px 12px; min-width: 110px; }"
+            "QPushButton:hover { background: #FF8585; }"
+            "QPushButton:disabled { color: #666; background: #333; border-color: #444; }"
+        )
+        self.delete_btn.clicked.connect(self._on_delete_mapping)
+        self.delete_btn.setEnabled(False)
+        title_row.addWidget(self.delete_btn)
         layout.addLayout(title_row)
 
         self.source_title = QLabel("Click a control on the visualizer")
@@ -400,11 +413,6 @@ class MappingInspectorPanel(QWidget):
         chain_layout.addLayout(chain_form)
         editor_layout.addWidget(chain_group)
 
-        self.delete_btn = QPushButton("Delete Mapping")
-        self.delete_btn.setObjectName("dangerButton")
-        self.delete_btn.clicked.connect(self._on_delete_mapping)
-        editor_layout.addWidget(self.delete_btn)
-
         scroll.setWidget(editor)
         self.stack.addWidget(scroll)
 
@@ -471,13 +479,10 @@ class MappingInspectorPanel(QWidget):
     def _apply_lock_state(self) -> None:
         can_edit = not self._locked
         self.stack.setEnabled(can_edit)
-        if not can_edit:
-            self.add_btn.setEnabled(False)
-            return
         has_selection = self._selected is not None
         has_mapping = self._editing_mapping is not None
-        self.add_btn.setEnabled(has_selection and not has_mapping)
-        self.delete_btn.setEnabled(has_mapping)
+        self.add_btn.setEnabled(can_edit and has_selection and not has_mapping)
+        self.delete_btn.setEnabled(can_edit and has_mapping)
 
     def _split_side_group(self, title: str):
         group = QGroupBox(title)
@@ -812,14 +817,6 @@ class MappingInspectorPanel(QWidget):
         self._apply_lock_state()
         self.mappings_changed.emit(self._engine.mappings)
 
-    def _on_delete_mapping(self) -> None:
-        if self._locked or self._editing_mapping is None:
-            return
-        self._engine.remove_mapping(self._editing_mapping.id)
-        self._editing_mapping = None
-        self.select_source(self._selected)
-        self.mappings_changed.emit(self._engine.mappings)
-
     def _add_macro_step(self) -> None:
         if self._editing_mapping is None:
             return
@@ -878,6 +875,16 @@ class MappingInspectorPanel(QWidget):
             return f"{index + 1}. CC {target.cc_number} ch={target.channel + 1}"
         notes = ",".join(str(n) for n in target.notes)
         return f"{index + 1}. {tt} note={notes} ch={target.channel + 1}"
+
+    def _on_delete_mapping(self) -> None:
+        """Remove the mapping currently shown in the inspector for this control."""
+        if self._locked or self._editing_mapping is None or self._selected is None:
+            return
+        mapping_id = self._editing_mapping.id
+        self._engine.remove_mapping(mapping_id)
+        self._editing_mapping = None
+        self.mappings_changed.emit(self._engine.mappings)
+        self.select_source(self._selected)
 
     def _apply_current(self) -> None:
         if self._locked or self._block_apply or self._editing_mapping is None or self._selected is None:

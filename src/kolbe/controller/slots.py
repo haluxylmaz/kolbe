@@ -10,13 +10,21 @@ from kolbe.controller.types import ControllerDevice
 MAX_CONTROLLER_SLOTS = 4
 SLOT_NUMBERS = tuple(range(1, MAX_CONTROLLER_SLOTS + 1))
 
-# Fixed accent per logical slot (Controller 1–4).
-SLOT_ACCENT_COLORS = (
-    "#00E5FF",  # 1 — cyan
-    "#FF2D95",  # 2 — magenta
-    "#FF9F1C",  # 3 — orange
-    "#44FF88",  # 4 — green
-)
+# UI accents stay in sync with ``ps_led.SLOT_LED_RGB`` (single source of truth for LEDs).
+def _accent_hex_from_led() -> tuple[str, ...]:
+    try:
+        from kolbe.controller.ps_led import SLOT_LED_RGB
+
+        out: list[str] = []
+        for number in SLOT_NUMBERS:
+            r, g, b = SLOT_LED_RGB[number]
+            out.append(f"#{r:02X}{g:02X}{b:02X}")
+        return tuple(out)
+    except Exception:
+        return ("#00E5FF", "#E91E63", "#FF9800", "#4CAF50")
+
+
+SLOT_ACCENT_COLORS = _accent_hex_from_led()
 
 
 def slot_id(slot: int) -> str:
@@ -36,7 +44,15 @@ def parse_slot_id(value: str) -> Optional[int]:
 
 def accent_for_slot(slot: int) -> str:
     index = max(0, int(slot) - 1)
-    return SLOT_ACCENT_COLORS[index % len(SLOT_ACCENT_COLORS)]
+    colors = _accent_hex_from_led()
+    return colors[index % len(colors)]
+
+
+def led_color_for_slot(slot: int) -> tuple[int, int, int]:
+    """Physical lightbar RGB for a logical slot (from ``ps_led.SLOT_LED_RGB``)."""
+    from kolbe.controller.ps_led import led_rgb_for_slot
+
+    return led_rgb_for_slot(slot)
 
 
 def slot_label(slot: int) -> str:
@@ -71,12 +87,30 @@ class ControllerSlot:
         return "Empty"
 
 
+def _clear_slot_fields(slot: ControllerSlot) -> None:
+    slot.hardware_id = None
+    slot.device = None
+    slot.connected = False
+    slot.battery_percent = None
+    slot.battery_text = "—"
+
+
+def _copy_binding(dst: ControllerSlot, src: ControllerSlot) -> None:
+    dst.hardware_id = src.hardware_id
+    dst.device = src.device
+    dst.connected = src.connected
+    dst.battery_percent = src.battery_percent
+    dst.battery_text = src.battery_text
+
+
 @dataclass
 class SlotRegistry:
     """
     Maps logical slots 1–4 ↔ hardware device ids.
 
-    Mappings / MIDI use slot keys (\"1\"…\"4\"). Hardware ids stay GUID-stable.
+    Manual assignments are authoritative: users may place pads in any slot
+    (including gaps). ``sync_live_devices`` only updates live/connected state
+    and auto-fills *empty* slots — it never forces a 1..N pack that undoes moves.
     """
 
     slots: dict[int, ControllerSlot] = field(default_factory=dict)
@@ -95,11 +129,7 @@ class SlotRegistry:
 
     def load_assignments(self, assignments: dict[str, str]) -> None:
         for number in SLOT_NUMBERS:
-            self.slots[number].hardware_id = None
-            self.slots[number].device = None
-            self.slots[number].connected = False
-            self.slots[number].battery_percent = None
-            self.slots[number].battery_text = "—"
+            _clear_slot_fields(self.slots[number])
         for key, hardware_id in (assignments or {}).items():
             number = parse_slot_id(str(key))
             if number is None or not hardware_id:
@@ -116,47 +146,79 @@ class SlotRegistry:
         return self.slots[int(slot)].hardware_id
 
     def assign(self, slot: int, hardware_id: Optional[str]) -> None:
-        """Manually assign hardware to a slot; clears the id from other slots."""
+        """
+        Manually assign hardware to any slot (1–4).
+
+        - Move into an empty slot: source slot is cleared.
+        - Move onto an occupied slot: the two pads **swap**.
+        - Assign untracked hardware onto an occupied slot: target takes it;
+          the previous occupant becomes unassigned (no error).
+        - Unassign (None): target is cleared.
+        """
         slot = int(slot)
         if slot not in self.slots:
             raise ValueError(f"Invalid slot {slot}")
-        if hardware_id:
-            for other in self.slots.values():
-                if other.number != slot and other.hardware_id == hardware_id:
-                    other.hardware_id = None
-                    other.device = None
-                    other.connected = False
-                    other.battery_percent = None
-                    other.battery_text = "—"
+
         target = self.slots[slot]
-        target.hardware_id = hardware_id or None
+
         if not hardware_id:
-            target.device = None
-            target.connected = False
-            target.battery_percent = None
-            target.battery_text = "—"
+            _clear_slot_fields(target)
+            return
+
+        hardware_id = str(hardware_id)
+        source_num = self.slot_for_hardware(hardware_id)
+        if source_num == slot:
+            return
+
+        # Snapshot incoming binding (from its current slot, if any).
+        incoming = ControllerSlot(number=0, hardware_id=hardware_id)
+        if source_num is not None:
+            _copy_binding(incoming, self.slots[source_num])
+            incoming.hardware_id = hardware_id
+
+        displaced = ControllerSlot(number=0)
+        has_displaced = bool(target.hardware_id and target.hardware_id != hardware_id)
+        if has_displaced:
+            _copy_binding(displaced, target)
+
+        if source_num is not None and has_displaced:
+            # Swap: previous target occupant ↔ source.
+            _copy_binding(self.slots[source_num], displaced)
+        elif source_num is not None:
+            # Move into empty (or self-cleared) target.
+            _clear_slot_fields(self.slots[source_num])
+        # else: fresh assign — displaced occupant (if any) is simply vacated.
+
+        _copy_binding(target, incoming)
+        target.hardware_id = hardware_id
 
     def sync_live_devices(self, devices: dict[str, ControllerDevice]) -> list[int]:
         """
-        Update live device pointers; auto-fill empty slots for new hardware.
+        Refresh connected/device pointers for assigned slots; auto-fill empties.
 
-        Returns list of slot numbers that changed connectivity/binding.
+        Does **not** compact or reorder existing manual assignments — that was
+        blocking Slot 2→4 moves (everything got packed back to 1..N).
         """
         changed: list[int] = []
+        live_ids = set(devices.keys())
 
-        for slot in self.slots.values():
+        for number in SLOT_NUMBERS:
+            slot = self.slots[number]
             was_connected = slot.connected
-            if slot.hardware_id and slot.hardware_id in devices:
-                slot.device = devices[slot.hardware_id]
+            hid = slot.hardware_id
+            if hid and hid in devices:
+                slot.device = devices[hid]
                 slot.connected = True
                 if not was_connected:
-                    changed.append(slot.number)
+                    changed.append(number)
+                if slot.battery_text in ("—", "Disconnected"):
+                    slot.battery_text = "…"
             else:
                 slot.device = None
                 if was_connected:
-                    changed.append(slot.number)
+                    changed.append(number)
                 slot.connected = False
-                if slot.hardware_id:
+                if hid:
                     slot.battery_text = "Disconnected"
                     slot.battery_percent = None
                 else:
@@ -165,7 +227,15 @@ class SlotRegistry:
 
         assigned_ids = {s.hardware_id for s in self.slots.values() if s.hardware_id}
         free_slots = [n for n in SLOT_NUMBERS if not self.slots[n].hardware_id]
-        for hardware_id, device in devices.items():
+
+        def _stable_key(hardware_id: str) -> tuple:
+            device = devices.get(hardware_id)
+            guid = (device.guid if device else None) or ""
+            if hardware_id.startswith("guid:"):
+                guid = guid or hardware_id[5:]
+            return (guid.lower(), hardware_id)
+
+        for hardware_id in sorted(live_ids, key=_stable_key):
             if hardware_id in assigned_ids:
                 continue
             if not free_slots:
@@ -173,11 +243,12 @@ class SlotRegistry:
             number = free_slots.pop(0)
             slot = self.slots[number]
             slot.hardware_id = hardware_id
-            slot.device = device
+            slot.device = devices[hardware_id]
             slot.connected = True
             slot.battery_text = "…"
-            changed.append(number)
+            slot.battery_percent = None
             assigned_ids.add(hardware_id)
+            changed.append(number)
 
         return sorted(set(changed))
 
