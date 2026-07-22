@@ -74,7 +74,7 @@ Kolbe can be compiled into a standalone application using PyInstaller. You can u
 ```powershell
 .\build_win.ps1
 # or manually via PyInstaller:
-pyinstaller Kolbe_v1.0.2.spec
+pyinstaller Kolbe_v1.0.3.spec
 ```
 
 **macOS:**
