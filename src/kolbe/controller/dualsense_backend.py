@@ -124,8 +124,14 @@ class DualSenseController:
         }
 
         battery = None
+        battery_label = None
         if hasattr(self._ds, "battery") and hasattr(self._ds.battery, "Level"):
-            battery = int(self._ds.battery.Level)
+            raw = int(self._ds.battery.Level)
+            # pydualsense reports 0–10 steps; normalize to percent when needed.
+            battery = raw * 10 if raw <= 10 else min(raw, 100)
+            battery_label = f"{battery}%"
+        else:
+            battery_label = "Wired"
 
         return ControllerState(
             device=self.device,
@@ -135,6 +141,7 @@ class DualSenseController:
             gyro=gyro,
             accelerometer=accelerometer,
             battery_percent=battery,
+            battery_label=battery_label,
         )
 
     @staticmethod

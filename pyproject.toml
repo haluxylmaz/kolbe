@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kolbe"
-version = "1.0.2"
+version = "1.0.3"
 description = "Convert gamepad/controller inputs into customizable MIDI signals"
 readme = "README.md"
 requires-python = ">=3.9"

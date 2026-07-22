@@ -87,9 +87,10 @@ class ControllerDevice:
     id: str
     name: str
     controller_type: ControllerType
-    backend: str  # "pygame" | "dualsense"
+    backend: str  # "pygame" | "dualsense" | "dualshock4"
     pygame_index: Optional[int] = None
     guid: Optional[str] = None
+    instance_id: Optional[int] = None
     num_buttons: int = 0
     num_axes: int = 0
     num_hats: int = 0
@@ -106,6 +107,7 @@ class ControllerState:
     gyro: dict[str, float] = field(default_factory=dict)
     accelerometer: dict[str, float] = field(default_factory=dict)
     battery_percent: Optional[int] = None
+    battery_label: Optional[str] = None
 
     def active_buttons(self) -> list[str]:
         return [name for name, pressed in self.buttons.items() if pressed]
@@ -141,5 +143,7 @@ class ControllerState:
         if self.touchpad != other.touchpad:
             return True
         if self.battery_percent != other.battery_percent:
+            return True
+        if self.battery_label != other.battery_label:
             return True
         return False

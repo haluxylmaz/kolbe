@@ -27,7 +27,7 @@ from kolbe.mapping.models import (
     default_page_names,
 )
 
-PRESET_VERSION = 8
+PRESET_VERSION = 9
 PRESET_FILTER = "Kolbe Presets (*.kolbe *.json);;All Files (*)"
 BASIC_TEMPLATE_NAME = "Basic Triggers & Bumpers"
 KOLBE_USER_DIR = Path.home() / ".kolbe"
@@ -194,6 +194,16 @@ def _migrate_mapping_dict(data: dict, source_version: int) -> dict:
         migrated["fade_out_sec"] = fade_out
         migrated["continuous_hold_enabled"] = hold
 
+    if source_version < 9:
+        # Legacy pygame-N / raw ids → logical slot keys "1"…"4" when possible.
+        slot = str(migrated.get("device_slot", DEFAULT_DEVICE_SLOT))
+        if slot.startswith("pygame-"):
+            try:
+                index = int(slot.split("-", 1)[1])
+                migrated["device_slot"] = str(min(max(index + 1, 1), 4))
+            except ValueError:
+                migrated["device_slot"] = DEFAULT_DEVICE_SLOT
+
     return migrated
 
 
@@ -221,9 +231,25 @@ def migrate_preset_data(data: object) -> dict:
     payload.setdefault("name", "Untitled")
     payload.setdefault("pages", default_page_names())
     payload.setdefault("device_pages", {})
+    payload.setdefault("slot_assignments", {})
     payload.setdefault("midi_output_port", "")
     payload.setdefault("mappings", [])
     payload["version"] = PRESET_VERSION
+
+    # Migrate device_pages keys pygame-N → slot numbers.
+    if source_version < 9:
+        old_pages = dict(payload.get("device_pages", {}))
+        new_pages: dict[str, int] = {}
+        for key, page in old_pages.items():
+            key_s = str(key)
+            if key_s.startswith("pygame-"):
+                try:
+                    index = int(key_s.split("-", 1)[1])
+                    key_s = str(min(max(index + 1, 1), 4))
+                except ValueError:
+                    continue
+            new_pages[key_s] = int(page)
+        payload["device_pages"] = new_pages
 
     migrated_mappings: list[dict] = []
     for item in payload["mappings"]:
@@ -294,6 +320,7 @@ def preset_to_dict(preset: PresetData) -> dict:
         "name": preset.name,
         "pages": list(preset.pages),
         "device_pages": dict(preset.device_pages),
+        "slot_assignments": dict(preset.slot_assignments),
         "midi_output_port": preset.midi_output_port,
         "mappings": [mapping_to_dict(m) for m in preset.mappings],
     }
@@ -304,6 +331,9 @@ def preset_from_dict(data: dict) -> PresetData:
     name = str(migrated.get("name", "Untitled"))
     pages = list(migrated.get("pages", default_page_names()))
     device_pages = {str(k): int(v) for k, v in migrated.get("device_pages", {}).items()}
+    slot_assignments = {
+        str(k): str(v) for k, v in migrated.get("slot_assignments", {}).items() if v
+    }
     midi_output_port = str(migrated.get("midi_output_port", ""))
 
     mappings: list[Mapping] = []
@@ -319,6 +349,7 @@ def preset_from_dict(data: dict) -> PresetData:
         mappings=mappings,
         device_pages=device_pages,
         midi_output_port=midi_output_port,
+        slot_assignments=slot_assignments,
     )
 
 

@@ -225,14 +225,12 @@ COLOR_STICK_DOT = COLOR_CYAN
 COLOR_TRIGGER_FILL = COLOR_CYAN
 COLOR_TOUCH = COLOR_AMBER
 
-# Per-controller accent colors (index 0 = first connected device, wraps).
+# Per-controller accent colors — aligned with logical slots 1–4.
 CONTROLLER_ACCENT_COLORS = (
-    "#44FF88",  # neon green
-    "#FF9F1C",  # neon orange
-    "#FF2D95",  # magenta / hot pink
-    "#00E5FF",  # cyan
-    "#B388FF",  # violet
-    "#FFEB3B",  # yellow
+    "#00E5FF",  # Controller 1 — cyan
+    "#FF2D95",  # Controller 2 — magenta
+    "#FF9F1C",  # Controller 3 — orange
+    "#44FF88",  # Controller 4 — green
 )
 
 
@@ -240,6 +238,10 @@ def accent_for_controller_index(index: int) -> str:
     if not CONTROLLER_ACCENT_COLORS:
         return COLOR_CYAN
     return CONTROLLER_ACCENT_COLORS[index % len(CONTROLLER_ACCENT_COLORS)]
+
+
+def accent_for_slot_number(slot: int) -> str:
+    return accent_for_controller_index(max(0, int(slot) - 1))
 
 
 FONT_MONO = "Menlo, Monaco, Courier New, monospace"

@@ -516,7 +516,19 @@ class MappingInspectorPanel(QWidget):
         self._page_id = page_id
         pages = self._engine.pages
         page_name = pages[page_id] if page_id < len(pages) else f"Page {page_id + 1}"
-        self.context_label.setText(f"Device: {device_slot}  ·  Layer: {page_name}")
+        from kolbe.controller.slots import accent_for_slot, parse_slot_id, slot_label
+
+        number = parse_slot_id(device_slot)
+        if number is not None:
+            color = accent_for_slot(number)
+            self.context_label.setStyleSheet(f"color: {color}; font-weight: 700;")
+            self.context_label.setText(f"{slot_label(number)}  ·  Layer: {page_name}")
+        elif device_slot == DEFAULT_DEVICE_SLOT:
+            self.context_label.setStyleSheet("color: #c5c8d0; font-weight: 600;")
+            self.context_label.setText(f"All Controllers (*)  ·  Layer: {page_name}")
+        else:
+            self.context_label.setStyleSheet("color: #c5c8d0; font-weight: 600;")
+            self.context_label.setText(f"Device: {device_slot}  ·  Layer: {page_name}")
 
     def refresh_from_engine(self) -> None:
         if self._selected is not None:

@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller onedir spec for Kolbe v1.0.2 (Windows).
+PyInstaller onedir spec for Kolbe v1.0.3 (Windows).
 Used by: .\\build_win.ps1  (ALWAYS via .\\.venv\\Scripts\\python.exe)
 
 FORCE-INCLUDES hidapi.dll by absolute path (not via hiddenimports).
@@ -21,7 +21,7 @@ SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 ENTRY = os.path.join(SRC_DIR, "kolbe", "__main__.py")
 ICON = os.path.join(PROJECT_ROOT, "icon.ico")
 RTHOOK_HIDAPI = os.path.join(SPEC_DIR, "rthooks", "pyi_rth_hidapi_path.py")
-APP_NAME = "Kolbe v1.0.2"
+APP_NAME = "Kolbe v1.0.3"
 
 # Absolute path on this machine (.venv / pydualsense).
 # Build-time only: locate DLL relative to this project / active .venv (no user home hardcode).

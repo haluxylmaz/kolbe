@@ -140,7 +140,13 @@ class TopBar(QFrame):
             widest = max(widest, metrics.horizontalAdvance(combo.itemText(index)))
         combo.setMinimumWidth(widest + pad)
 
-    def set_devices(self, devices: dict[str, object], selected_id: Optional[str] = None) -> None:
+    def set_devices(
+        self,
+        devices: dict[str, object],
+        selected_id: Optional[str] = None,
+        *,
+        hardware_count: Optional[int] = None,
+    ) -> None:
         current = selected_id or self.device_combo.currentData()
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
@@ -153,7 +159,8 @@ class TopBar(QFrame):
                 self.device_combo.setCurrentIndex(idx)
         self.device_combo.blockSignals(False)
         self._fit_combo_to_contents(self.device_combo)
-        count = len(devices)
+        # Count physical pads when provided — never the fixed 4-slot array length.
+        count = hardware_count if hardware_count is not None else len(devices)
         if count:
             self.connection_label.setText(f"Controllers: {count}")
             self.connection_label.setObjectName("statusConnected")

@@ -3,47 +3,67 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtWidgets import QHBoxLayout, QMainWindow, QMessageBox, QSplitter, QVBoxLayout, QWidget, QLabel
+from PyQt6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
 
-from kolbe.controller.types import ControllerDevice, ControllerState, InputSource
 from kolbe import APP_NAME
-from kolbe.gui.styles import accent_for_controller_index
+from kolbe.controller.slots import (
+    SLOT_NUMBERS,
+    accent_for_slot,
+    slot_id,
+    slot_label,
+)
+from kolbe.controller.types import ControllerDevice, ControllerState, InputSource
+from kolbe.gui.controller_slots_panel import ControllerSlotsPanel
 from kolbe.gui.controller_thread import ControllerThread, PygameEventPump
 from kolbe.gui.mapping_inspector import MappingInspectorPanel
 from kolbe.gui.system_monitor import SystemMonitorWidget
 from kolbe.gui.top_bar import TopBar
 from kolbe.gui.visualizer_widget import VisualizerPanel
 from kolbe.mapping.engine import MappingEngine
-from kolbe.mapping.models import DEFAULT_DEVICE_SLOT, Mapping, PresetData
+from kolbe.mapping.models import DEFAULT_DEVICE_SLOT, PresetData
 from kolbe.mapping.preset_manager import PresetManager
-from kolbe.midi.virtual_port import DEFAULT_PORT_NAME, VirtualMidiPort, list_midi_ports, supports_virtual_midi
+from kolbe.midi.virtual_port import (
+    DEFAULT_PORT_NAME,
+    VirtualMidiPort,
+    list_midi_ports,
+    supports_virtual_midi,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
-    """Kolbe main window — multi-device show control station."""
+    """Kolbe main window — up to 4 fixed controller slots → MIDI."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} — Gamepad MIDI")
-        self.setMinimumSize(1100, 760)
-        self.resize(1360, 900)
+        self.setMinimumSize(1100, 820)
+        self.resize(1360, 960)
 
         self._midi_port: Optional[VirtualMidiPort] = None
         self._controller_thread: Optional[ControllerThread] = None
         self._pygame_pump = PygameEventPump(self)
         self._mapping_engine = MappingEngine(self)
         self._preset_manager = PresetManager()
-        self._selected_device_id: Optional[str] = None
-        self._device_order: list[str] = []
-        self._pending_states: dict[str, ControllerState] = {}
+        self._selected_slot: int = 1
+        self._hardware_devices: dict[str, ControllerDevice] = {}
+        self._pending_states: dict[str, ControllerState] = {}  # keyed by slot id
         self._state_flush_scheduled = False
-        self._accent_color = accent_for_controller_index(0)
-        self._device_states: dict[str, ControllerState] = {}
+        self._accent_color = accent_for_slot(1)
+        self._slot_states: dict[str, ControllerState] = {}  # slot id → latest state
 
         central = QWidget()
         central.setStyleSheet("background-color: #121212;")
@@ -60,7 +80,7 @@ class MainWindow(QMainWindow):
             on_cleanup_project=self._on_cleanup_project,
         )
         self.top_bar.page_selected.connect(self._on_page_selected)
-        self.top_bar.device_selected.connect(self._on_device_selected)
+        self.top_bar.device_selected.connect(self._on_topbar_slot_selected)
         column_layout.addWidget(self.top_bar)
 
         self.connection_bar = QLabel("Waiting for controllers…")
@@ -70,6 +90,12 @@ class MainWindow(QMainWindow):
             "background-color: #252525; color: #888888; border-bottom: 1px solid #333333; padding: 4px 16px;"
         )
         column_layout.addWidget(self.connection_bar)
+
+        self.slots_panel = ControllerSlotsPanel()
+        self.slots_panel.slot_selected.connect(self._on_slot_selected)
+        self.slots_panel.slot_assignment_changed.connect(self._on_slot_assignment_changed)
+        self.slots_panel.refresh_requested.connect(self._on_rescan_controllers)
+        column_layout.addWidget(self.slots_panel)
 
         main_splitter = QSplitter(Qt.Orientation.Vertical)
         main_splitter.setHandleWidth(2)
@@ -114,31 +140,40 @@ class MainWindow(QMainWindow):
 
         preset = self._preset_manager.load_startup_preset()
         self._apply_preset(preset)
-        self.system_monitor.log_system("Kolbe started")
-        self.visualizer_panel.set_accent_color(self._accent_color)
-        self.mapping_panel.set_accent_color(self._accent_color)
-
+        self.system_monitor.log_system("Kolbe started — 4 controller slots ready")
+        self._apply_slot_accent(self._selected_slot)
         self._start_controller_thread()
 
     def _edit_device_id(self) -> str:
-        return self._selected_device_id or DEFAULT_DEVICE_SLOT
+        """Mappings are stamped with the selected logical slot key."""
+        return slot_id(self._selected_slot)
 
     def _edit_page_id(self) -> int:
-        if self._selected_device_id:
-            return self._mapping_engine.active_page(self._selected_device_id)
-        return 0
+        return self._mapping_engine.active_page(self._edit_device_id())
 
     def _apply_preset(self, preset: PresetData) -> None:
         self._mapping_engine.load_preset(preset)
+        self.slots_panel.apply_assignments(preset.slot_assignments)
         self.top_bar.set_pages(preset.pages)
+        self._sync_topbar_slots()
         self.mapping_panel.set_edit_context(self._edit_device_id(), self._edit_page_id())
         self.mapping_panel.refresh_from_engine()
         self._refresh_mapped_indicators()
         self._preset_manager.current_name = preset.name
         self.top_bar.set_preset_name(preset.name)
         self._apply_midi_output_port(preset.midi_output_port)
-        self._mapping_engine.log_system(f"Preset loaded: {preset.name} ({len(preset.mappings)} mappings)")
+        self._mapping_engine.log_system(
+            f"Preset loaded: {preset.name} ({len(preset.mappings)} mappings)"
+        )
         logger.info("Preset applied: %s", preset.name)
+
+    def _persist_slot_assignments(self) -> None:
+        preset = self._mapping_engine.preset
+        preset.slot_assignments = self.slots_panel.assignments()
+        try:
+            self._preset_manager.save_startup_preset(preset)
+        except OSError as exc:
+            logger.warning("Could not save slot assignments: %s", exc)
 
     def _apply_midi_output_port(self, port_name: str) -> None:
         self.top_bar.refresh_midi_ports(preferred_port=port_name)
@@ -176,42 +211,98 @@ class MainWindow(QMainWindow):
 
     def _on_page_selected(self, page_id: int) -> None:
         device_id = self._edit_device_id()
-        if device_id != DEFAULT_DEVICE_SLOT:
-            self._mapping_engine.set_active_page(device_id, page_id)
+        self._mapping_engine.set_active_page(device_id, page_id)
         self.mapping_panel.set_edit_context(device_id, page_id)
         self.mapping_panel.refresh_from_engine()
         self._refresh_mapped_indicators()
-        if self._selected_device_id and self._selected_device_id in self._device_states:
-            self.visualizer_panel.update_state(self._device_states[self._selected_device_id])
+        if device_id in self._slot_states:
+            self.visualizer_panel.update_state(self._slot_states[device_id])
 
-    def _on_device_selected(self, device_id: str) -> None:
-        self._selected_device_id = device_id
-        self._apply_controller_accent(device_id)
+    def _on_topbar_slot_selected(self, slot_key: str) -> None:
+        try:
+            number = int(slot_key)
+        except (TypeError, ValueError):
+            return
+        self._on_slot_selected(number)
+
+    def _on_slot_selected(self, slot: int) -> None:
+        if slot not in SLOT_NUMBERS:
+            return
+        self._selected_slot = int(slot)
+        self.slots_panel.set_selected_slot(slot)
+        self._apply_slot_accent(slot)
+        device_id = slot_id(slot)
         page_id = self._mapping_engine.active_page(device_id)
         self.top_bar.set_active_page(page_id)
+        # Keep top-bar combo in sync without re-entry loops.
+        idx = self.top_bar.device_combo.findData(device_id)
+        if idx >= 0 and self.top_bar.device_combo.currentIndex() != idx:
+            self.top_bar.device_combo.blockSignals(True)
+            self.top_bar.device_combo.setCurrentIndex(idx)
+            self.top_bar.device_combo.blockSignals(False)
+
         self.mapping_panel.set_edit_context(device_id, page_id)
         self.mapping_panel.refresh_from_engine()
         self._refresh_mapped_indicators()
-        if device_id in self._device_states:
-            self.visualizer_panel.update_state(self._device_states[device_id])
-            self.connection_bar.setText(f"Editing: {self._device_states[device_id].device.name}")
+
+        snap = next((s for s in self.slots_panel.snapshot_slots() if s.number == slot), None)
+        if snap and snap.connected and device_id in self._slot_states:
+            self.visualizer_panel.update_state(self._slot_states[device_id])
+            self.connection_bar.setText(f"Editing: {slot_label(slot)} — {snap.display_name}")
             self.connection_bar.setStyleSheet(
                 f"background-color: #252525; color: {self._accent_color}; "
                 f"border-bottom: 1px solid {self._accent_color}; padding: 4px 16px;"
             )
+        elif snap and snap.hardware_id and not snap.connected:
+            self.connection_bar.setText(f"{slot_label(slot)} — Disconnected")
+            self.connection_bar.setStyleSheet(
+                "background-color: #252525; color: #FF6B6B; "
+                "border-bottom: 1px solid #FF6B6B; padding: 4px 16px;"
+            )
+        else:
+            self.connection_bar.setText(f"{slot_label(slot)} — Empty (assign a gamepad)")
+            self.connection_bar.setStyleSheet(
+                "background-color: #252525; color: #888888; "
+                "border-bottom: 1px solid #333333; padding: 4px 16px;"
+            )
 
-    def _apply_controller_accent(self, device_id: str) -> None:
-        try:
-            index = self._device_order.index(device_id)
-        except ValueError:
-            index = 0
-        color = accent_for_controller_index(index)
+    def _on_slot_assignment_changed(self, slot: int, _hardware_id: object) -> None:
+        self._sync_topbar_slots()
+        self._persist_slot_assignments()
+        self._mapping_engine.log_system(f"{slot_label(slot)} assignment updated")
+        if slot == self._selected_slot:
+            self._on_slot_selected(slot)
+
+    def _on_rescan_controllers(self) -> None:
+        if self._controller_thread is not None:
+            self._controller_thread.request_refresh()
+            self._mapping_engine.log_system("Controller rescan requested")
+
+    def _apply_slot_accent(self, slot: int) -> None:
+        color = accent_for_slot(slot)
         self._accent_color = color
         self.visualizer_panel.set_accent_color(color)
         self.mapping_panel.set_accent_color(color)
 
+    def _sync_topbar_slots(self) -> None:
+        devices: dict[str, object] = {}
+        for slot in self.slots_panel.snapshot_slots():
+            key = slot.slot_key
+            if slot.connected and slot.device is not None:
+                label = f"{slot_label(slot.number)}: {slot.device.name}"
+            elif slot.hardware_id:
+                label = f"{slot_label(slot.number)}: Disconnected"
+            else:
+                label = f"{slot_label(slot.number)}: Empty"
+            devices[key] = type("Dev", (), {"name": label})()
+        self.top_bar.set_devices(
+            devices,
+            slot_id(self._selected_slot),
+            hardware_count=len(self._hardware_devices),
+        )
+
     def _on_engine_page_changed(self, device_id: str, page_id: int) -> None:
-        if device_id == self._selected_device_id:
+        if device_id == self._edit_device_id():
             self.top_bar.set_active_page(page_id)
             self.mapping_panel.set_edit_context(device_id, page_id)
             self.mapping_panel.refresh_from_engine()
@@ -219,6 +310,7 @@ class MainWindow(QMainWindow):
 
     def _on_save_preset(self) -> None:
         preset = self._mapping_engine.preset
+        preset.slot_assignments = self.slots_panel.assignments()
         if self._preset_manager.save_with_dialog(self, preset):
             self.top_bar.set_preset_name(preset.name)
             self._preset_manager.save_startup_preset(preset)
@@ -257,6 +349,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         preset = self._preset_manager.apply_template(template_name)
+        preset.slot_assignments = self.slots_panel.assignments()
         self._apply_preset(preset)
         self._preset_manager.save_startup_preset(preset)
 
@@ -281,6 +374,7 @@ class MainWindow(QMainWindow):
 
         preset = self._mapping_engine.preset
         preset.midi_output_port = port_name
+        preset.slot_assignments = self.slots_panel.assignments()
         try:
             self._preset_manager.save_startup_preset(preset)
         except OSError as exc:
@@ -295,32 +389,58 @@ class MainWindow(QMainWindow):
         self._controller_thread.start()
 
     def _on_devices_changed(self, devices: dict) -> None:
-        previous = list(self._device_order)
-        # Keep stable color indices for devices that remain connected.
-        self._device_order = [did for did in previous if did in devices]
-        for device_id in devices:
-            if device_id not in self._device_order:
-                self._device_order.append(device_id)
+        self._hardware_devices = dict(devices)
+        self.slots_panel.set_hardware_devices(self._hardware_devices)
+        # Keep persisted assignments when possible; auto-fill empties.
+        self._persist_slot_assignments()
+        self._sync_topbar_slots()
 
-        self.top_bar.set_devices(devices, self._selected_device_id)
-        if not self._selected_device_id and devices:
-            first_id = next(iter(devices.keys()))
-            self.top_bar.device_combo.setCurrentIndex(0)
-            self._on_device_selected(first_id)
-        elif self._selected_device_id and self._selected_device_id in devices:
-            self._apply_controller_accent(self._selected_device_id)
-        names = ", ".join(getattr(d, "name", k) for k, d in devices.items())
-        self.connection_bar.setText(f"Connected: {names}" if names else "No controllers")
-        accent = self._accent_color if names else "#888888"
-        self.connection_bar.setStyleSheet(
-            f"background-color: #252525; color: {accent}; border-bottom: 1px solid #333333; padding: 4px 16px;"
+        connected = [s for s in self.slots_panel.snapshot_slots() if s.connected]
+        if connected:
+            names = ", ".join(f"{slot_label(s.number)}={s.display_name}" for s in connected)
+            self.connection_bar.setText(f"Live: {names}")
+            self.connection_bar.setStyleSheet(
+                f"background-color: #252525; color: {self._accent_color}; "
+                f"border-bottom: 1px solid #333333; padding: 4px 16px;"
+            )
+        else:
+            self.connection_bar.setText("No controllers connected — plug in a pad and hit Refresh")
+            self.connection_bar.setStyleSheet(
+                "background-color: #252525; color: #888888; "
+                "border-bottom: 1px solid #333333; padding: 4px 16px;"
+            )
+
+        # Drop cached states for slots whose hardware left.
+        live_slot_keys = {s.slot_key for s in self.slots_panel.snapshot_slots() if s.connected}
+        for key in list(self._slot_states):
+            if key not in live_slot_keys:
+                self._slot_states.pop(key, None)
+
+        self._mapping_engine.log_system(
+            f"Controllers updated: {len(devices)} hardware / {len(connected)} slotted"
         )
-        self._mapping_engine.log_system(f"Controllers updated: {len(devices)} connected")
+        self._on_slot_selected(self._selected_slot)
+
+    def _remap_state_to_slot(self, state: ControllerState) -> Optional[ControllerState]:
+        """Bind hardware input to its logical slot for MIDI (independent per slot)."""
+        hardware_id = state.device.id
+        slot_number = self.slots_panel.registry.slot_for_hardware(hardware_id)
+        if slot_number is None:
+            return None
+        slot_device = replace(state.device, id=slot_id(slot_number))
+        return replace(state, device=slot_device)
 
     def _on_state_updated(self, state: ControllerState) -> None:
-        # Latest-wins coalesce: drain at most one flush per event-loop turn so a
-        # queued burst of signals never runs process_state N times for stale snaps.
-        self._pending_states[state.device.id] = state
+        remapped = self._remap_state_to_slot(state)
+        if remapped is None:
+            return
+        label = state.battery_label or ("Wired" if state.battery_percent is None else None)
+        if label:
+            self.slots_panel.update_battery(state.device.id, state.battery_percent, label)
+        else:
+            self.slots_panel.update_battery(state.device.id, state.battery_percent)
+        # Latest-wins coalesce per slot so simultaneous pads never block each other.
+        self._pending_states[remapped.device.id] = remapped
         if not self._state_flush_scheduled:
             self._state_flush_scheduled = True
             QTimer.singleShot(0, self._flush_pending_states)
@@ -329,14 +449,16 @@ class MainWindow(QMainWindow):
         self._state_flush_scheduled = False
         pending = self._pending_states
         self._pending_states = {}
+        selected_key = self._edit_device_id()
         for state in pending.values():
-            device_id = state.device.id
-            self._device_states[device_id] = state
+            slot_key = state.device.id
+            self._slot_states[slot_key] = state
+            # Independent MIDI dispatch per slot — no shared mutable gate.
             self._mapping_engine.process_state(state)
             self.system_monitor.record_frame()
             if state.active_buttons() or state.non_zero_axes():
                 self.system_monitor.record_activity()
-            if device_id == self._selected_device_id:
+            if slot_key == selected_key:
                 self.visualizer_panel.update_state(state)
 
     def _on_controller_error(self, message: str) -> None:
@@ -354,6 +476,7 @@ class MainWindow(QMainWindow):
 
         logger.info("Application shutdown started")
         self._shutdown_complete = True
+        self._persist_slot_assignments()
 
         if self._controller_thread is not None:
             self._controller_thread.stop()

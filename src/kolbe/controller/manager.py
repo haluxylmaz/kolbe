@@ -51,7 +51,7 @@ class ControllerManager:
         if device_index is not None:
             self._device_index = device_index
 
-        devices = detect_controllers()
+        devices = detect_controllers(release_after_probe=False)
         if not devices:
             raise RuntimeError("No gamepads detected. Connect a controller and try again.")
         if self._device_index >= len(devices):
@@ -59,12 +59,34 @@ class ControllerManager:
                 f"Controller index {self._device_index} out of range "
                 f"(found {len(devices)} device(s))."
             )
+        return self.connect_device(devices[self._device_index])
 
+    def connect_device(self, device: ControllerDevice) -> ControllerDevice:
+        """Open a specific detected device without re-enumerating (multi-pad safe)."""
         self.disconnect()
-        self._device = devices[self._device_index]
-        self._backend = self._create_backend(self._device)
+        self._device = device
+        if device.pygame_index is not None:
+            self._device_index = device.pygame_index
+        self._backend = self._create_backend(device)
         self._backend.open()
         return self._device
+
+    def update_device_metadata(self, device: ControllerDevice) -> None:
+        """Refresh pygame index / identity after a hotplug rescan without reopening HID."""
+        if self._device is None or self._device.id != device.id:
+            return
+        self._device = device
+        backend = self._backend
+        if hasattr(backend, "device"):
+            backend.device = device  # type: ignore[union-attr]
+        if device.pygame_index is not None:
+            self._device_index = device.pygame_index
+        if isinstance(backend, PygameController):
+            # Force GUID rebind — never keep a stale joystick handle.
+            try:
+                backend.open()
+            except Exception:
+                logger.exception("Failed to rebind pygame pad: %s", device.name)
 
     def disconnect(self) -> None:
         if self._backend is not None:

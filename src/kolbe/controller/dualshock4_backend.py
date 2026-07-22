@@ -115,6 +115,11 @@ class DualShock4Controller:
             gyro=dict(parsed.gyro),
             accelerometer=dict(parsed.accelerometer),
             battery_percent=parsed.battery_percent,
+            battery_label=(
+                f"{parsed.battery_percent}%"
+                if parsed.battery_percent is not None
+                else "Wired"
+            ),
         )
 
     def _read_latest_report(self) -> Optional[bytes]:

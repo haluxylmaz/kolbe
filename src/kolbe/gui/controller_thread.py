@@ -6,18 +6,16 @@ import logging
 import time
 from typing import Optional
 
-from PyQt6.QtCore import QObject, QThread, pyqtSignal
+from PyQt6.QtCore import QMutex, QObject, QThread, pyqtSignal
 
 from kolbe.controller.multi_manager import MultiControllerManager
 from kolbe.controller.types import ControllerState
 
 logger = logging.getLogger(__name__)
 
-# Target poll rate (Hz). pygame.time.Clock is more accurate than time.sleep on Windows.
 POLL_RATE_HZ = 125
-# Ignore sub-~1.2% axis deltas after deadzone so micro-jitter does not flood Qt.
 AXIS_EMIT_EPSILON = 0.012
-DEVICE_REFRESH_SEC = 1.0
+DEVICE_REFRESH_SEC = 2.0
 
 
 class PygameEventPump(QObject):
@@ -55,7 +53,7 @@ class PygameEventPump(QObject):
 
 
 class ControllerWorker(QObject):
-    """Polls controllers at a fixed Hz and emits only meaningful state changes."""
+    """Polls all controllers at a fixed Hz and emits per-device state changes."""
 
     state_updated = pyqtSignal(object)
     devices_changed = pyqtSignal(object)
@@ -67,6 +65,16 @@ class ControllerWorker(QObject):
         self._manager: Optional[MultiControllerManager] = None
         self._last_emitted: dict[str, ControllerState] = {}
         self._last_refresh_mono = 0.0
+        self._force_refresh = False
+        self._lock = QMutex()
+
+    def request_refresh(self) -> None:
+        """Ask the worker to rescan hardware on the next poll tick."""
+        self._lock.lock()
+        try:
+            self._force_refresh = True
+        finally:
+            self._lock.unlock()
 
     def start_polling(self) -> None:
         import pygame
@@ -89,14 +97,20 @@ class ControllerWorker(QObject):
             try:
                 if self._manager is not None:
                     now = time.monotonic()
-                    if now - self._last_refresh_mono >= DEVICE_REFRESH_SEC:
+                    self._lock.lock()
+                    force = self._force_refresh
+                    self._force_refresh = False
+                    self._lock.unlock()
+
+                    if force or now - self._last_refresh_mono >= DEVICE_REFRESH_SEC:
                         self._last_refresh_mono = now
                         added, removed = self._manager.refresh()
-                        if added or removed:
+                        if force or added or removed:
                             self._prune_emitted_cache(self._manager.connected_ids)
                             self.devices_changed.emit(self._manager.devices)
 
                     self._flush_sdl_event_queue()
+                    # Each pad is polled independently — concurrent MIDI for all slots.
                     for state in self._manager.poll_all(pump_events=False):
                         self._emit_if_changed(state)
             except Exception as exc:
@@ -104,7 +118,6 @@ class ControllerWorker(QObject):
                 self.error_occurred.emit(str(exc))
                 break
 
-            # Caps rate; more precise than time.sleep on Windows.
             clock.tick(POLL_RATE_HZ)
 
         self._cleanup()
@@ -115,7 +128,6 @@ class ControllerWorker(QObject):
     def _emit_if_changed(self, state: ControllerState) -> None:
         device_id = state.device.id
         previous = self._last_emitted.get(device_id)
-        # Backend may reuse the same object when raw inputs are unchanged.
         if previous is state:
             return
         if not state.significant_change_from(previous, axis_epsilon=AXIS_EMIT_EPSILON):
@@ -137,7 +149,6 @@ class ControllerWorker(QObject):
             if not pygame.get_init():
                 return
             pygame.event.pump()
-            # Discard backlog so multi-pad 1000Hz noise cannot inflate the SDL queue.
             pygame.event.clear()
         except Exception:
             logger.debug("pygame event flush failed", exc_info=True)
@@ -160,6 +171,10 @@ class ControllerThread(QThread):
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._worker: Optional[ControllerWorker] = None
+
+    def request_refresh(self) -> None:
+        if self._worker is not None:
+            self._worker.request_refresh()
 
     def run(self) -> None:
         self._worker = ControllerWorker()

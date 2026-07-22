@@ -79,9 +79,9 @@ if (Test-Path -LiteralPath $HidDllSrc) {
     Write-Warning "hidapi.dll not found under .venv pydualsense — DualSense may fail in the frozen EXE."
 }
 
-Write-Host "Building Kolbe v1.0.2 with .venv PyInstaller..."
+Write-Host "Building Kolbe v1.0.3 with .venv PyInstaller..."
 & $Python -m PyInstaller "packaging\kolbe_win.spec" --noconfirm --clean
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
 
 Write-Host ""
-Write-Host "Done. Run: dist\Kolbe v1.0.2\Kolbe v1.0.2.exe"
+Write-Host "Done. Run: dist\Kolbe v1.0.3\Kolbe v1.0.3.exe"

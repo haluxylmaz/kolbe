@@ -393,6 +393,8 @@ class PresetData:
     mappings: list[Mapping] = field(default_factory=list)
     device_pages: dict[str, int] = field(default_factory=dict)
     midi_output_port: str = ""
+    # Logical slot key ("1"…"4") → hardware device id (guid:… / name:…)
+    slot_assignments: dict[str, str] = field(default_factory=dict)
 
     def active_page_for(self, device_id: str) -> int:
         return self.device_pages.get(device_id, 0)
